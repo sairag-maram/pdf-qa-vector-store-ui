@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+"""
+PDF Q&A on OpenAI Vector Stores
+- Responses API first (file_search), Assistants API fallback
+- Tabs: Ask, Summarize ALL, Files
+- Stanford color theme with high-contrast text in white cards (works in dark mode)
+"""
+
 import os
 import time
 from pathlib import Path
@@ -14,19 +21,23 @@ st.set_page_config(
     page_title="PDF Q&A • Vector Store",
     page_icon="📄",
     layout="centered",
-    menu_items={"Get help": None, "Report a bug": None, "About": "PDF Q&A on OpenAI Vector Stores"},
+    menu_items={
+        "Get help": None,
+        "Report a bug": None,
+        "About": "PDF Q&A on OpenAI Vector Stores",
+    },
 )
 
-# --- Stanford colors, but with HIGH CONTRAST + neutral backgrounds
-# (keep Streamlit theme text colors; only accent & borders are customized)
-st.markdown("""
+# ---------------- Theme (Stanford colors + high-contrast cards) ----------------
+st.markdown(
+    """
 <style>
 :root{
   --accent:#8C1515;          /* Stanford Cardinal */
   --accent-2:#B1040E;        /* Bright Red */
   --border:#E5E7EB;          /* Neutral light gray */
   --muted:#4D4F53;           /* Stanford Cool Gray */
-  --card-bg:#FFFFFF;         /* White card */
+  --card-bg:#FFFFFF;         /* White card (readable in dark mode with overrides below) */
   --chip-bg:#FBE9EA;         /* Very light cardinal tint */
 }
 
@@ -35,11 +46,21 @@ div.app-header{display:flex;gap:.75rem;align-items:center;margin:0 0 .5rem 0}
 div.app-header h1{font-weight:800;margin:0;color:var(--accent)}
 div.kicker{color:var(--muted);font-size:.95rem;margin:-.25rem 0 .75rem 0}
 
-/* Cards (white, subtle shadow & border) */
+/* Cards */
 div.card{border:1px solid var(--border);background:var(--card-bg);padding:16px 18px;border-radius:14px;box-shadow:0 1px 8px rgba(0,0,0,.06)}
 div.answer-card{border:1px solid var(--border);background:var(--card-bg);padding:16px 18px;border-radius:14px;margin:.5rem 0 1rem 0;box-shadow:0 1px 8px rgba(0,0,0,.06)}
 h4.compact{margin:.1rem 0 .6rem 0}
 .small{color:var(--muted);font-size:.9rem}
+
+/* 🔧 Fix: dark text inside white cards even in dark mode */
+div.card, div.answer-card { color: #1f2937 !important; } /* slate-800 */
+div.card h1, div.card h2, div.card h3, div.card h4, div.card h5,
+div.card p, div.card li, div.card span, div.card code,
+div.answer-card h1, div.answer-card h2, div.answer-card h3,
+div.answer-card h4, div.answer-card h5, div.answer-card p,
+div.answer-card li, div.answer-card span, div.answer-card code {
+  color: #1f2937 !important;
+}
 
 /* Chips for sources */
 span.chip{display:inline-block;padding:4px 10px;border-radius:999px;background:var(--chip-bg);
@@ -63,21 +84,24 @@ div.stButton > button:hover, .stDownloadButton > button:hover{
   color:var(--accent); border-bottom-color:var(--accent); font-weight:700;
 }
 
-/* Progress bar in Cardinal */
+/* Progress bar */
 [data-testid="stProgressBar"] > div > div > div { background: var(--accent) !important; }
 
 /* Links */
 a{color:var(--accent-2)}
 </style>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
-# Pull from Streamlit Secrets (cloud) if present
+# ---------------- Env / Secrets ----------------
+# Streamlit Cloud secrets (if set)
 if "OPENAI_API_KEY" in st.secrets:
     os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_API_KEY"]
 if "OPENAI_VECTOR_STORE_ID" in st.secrets:
     os.environ["OPENAI_VECTOR_STORE_ID"] = st.secrets["OPENAI_VECTOR_STORE_ID"]
 
-# Load .env for local dev
+# Local .env (for dev)
 load_dotenv(Path(__file__).with_name(".env"))
 
 def get_client() -> OpenAI:
@@ -118,18 +142,24 @@ try:
 except Exception:
     pass
 
-if api_key: os.environ["OPENAI_API_KEY"] = api_key
-if vector_store_id: os.environ["OPENAI_VECTOR_STORE_ID"] = vector_store_id
+if api_key:
+    os.environ["OPENAI_API_KEY"] = api_key
+if vector_store_id:
+    os.environ["OPENAI_VECTOR_STORE_ID"] = vector_store_id
 
 # ---------------- Header ----------------
 st.markdown('<div class="app-header"><span style="font-size:1.75rem">📄</span><h1>PDF Q&A</h1></div>', unsafe_allow_html=True)
-st.markdown('<div class="kicker">Ask questions against your OpenAI Vector Store, or summarize every file. Answers include a short quote and sources.</div>', unsafe_allow_html=True)
+st.markdown(
+    '<div class="kicker">Ask questions against your OpenAI Vector Store, or summarize every file. Answers include a short quote and sources.</div>',
+    unsafe_allow_html=True,
+)
 
 # ---------------- Tabs ----------------
 tab_ask, tab_all, tab_files = st.tabs(["💬 Ask", "🗂️ Summarize ALL", "📁 Files"])
 
 # ---------------- Helpers ----------------
 def extract_file_ids_from_responses(resp) -> List[str]:
+    """Extract file IDs from Responses API output annotations."""
     file_ids: Set[str] = set()
     try:
         for block in resp.output:
@@ -140,35 +170,42 @@ def extract_file_ids_from_responses(resp) -> List[str]:
                             if getattr(ann, "type", None) == "file_citation":
                                 fc = getattr(ann, "file_citation", None)
                                 fid = getattr(fc, "file_id", None) if fc else None
-                                if fid: file_ids.add(fid)
+                                if fid:
+                                    file_ids.add(fid)
     except Exception:
         pass
     return list(file_ids)
 
 def extract_file_ids_from_messages(messages_list) -> List[str]:
+    """Extract file IDs from Assistants API message annotations."""
     file_ids: Set[str] = set()
     try:
         for msg in messages_list:
-            if getattr(msg, "role", "") != "assistant": continue
+            if getattr(msg, "role", "") != "assistant":
+                continue
             for item in (msg.content or []):
                 if getattr(item, "type", None) == "text":
                     for ann in (getattr(item.text, "annotations", []) or []):
                         if getattr(ann, "type", None) == "file_citation":
                             fid = getattr(ann.file_citation, "file_id", None)
-                            if fid: file_ids.add(fid)
+                            if fid:
+                                file_ids.add(fid)
     except Exception:
         pass
     return list(file_ids)
 
-def list_vs_files(client: OpenAI, vector_store_id: str) -> List[Tuple[str, str]]:
-    after = None; files = []
+def list_vs_files(client: OpenAI, vs_id: str) -> List[Tuple[str, str]]:
+    """(id, filename) list from a Vector Store."""
+    after = None
+    items = []
     while True:
-        page = client.vector_stores.files.list(vector_store_id=vector_store_id, limit=100, after=after)
-        files.extend(page.data)
-        if not page.has_more: break
+        page = client.vector_stores.files.list(vector_store_id=vs_id, limit=100, after=after)
+        items.extend(page.data)
+        if not page.has_more:
+            break
         after = page.last_id
     out: List[Tuple[str, str]] = []
-    for it in files:
+    for it in items:
         try:
             f = client.files.retrieve(it.id)
             out.append((it.id, f.filename or it.id))
@@ -176,37 +213,47 @@ def list_vs_files(client: OpenAI, vector_store_id: str) -> List[Tuple[str, str]]
             out.append((it.id, it.id))
     return out
 
-# Responses-first (supporting different shapes), Assistants fallback
+# --- Responses-first (multiple shapes), Assistants fallback ---
 def ask_with_responses(client: OpenAI, model: str, vs_id: str, system: str, userq: str):
+    # Newest: top-level file_search
     try:
         return client.responses.create(
             model=model,
-            input=[{"role": "system", "content": system.strip()},
-                   {"role": "user", "content": userq.strip()}],
+            input=[
+                {"role": "system", "content": system.strip()},
+                {"role": "user", "content": userq.strip()},
+            ],
             tools=[{"type": "file_search"}],
             file_search={"vector_store_ids": [vs_id]},
         ), "responses"
     except Exception:
         pass
+    # Mid: tool_resources kwarg
     try:
         return client.responses.create(
             model=model,
-            input=[{"role": "system", "content": system.strip()},
-                   {"role": "user", "content": userq.strip()}],
+            input=[
+                {"role": "system", "content": system.strip()},
+                {"role": "user", "content": userq.strip()},
+            ],
             tools=[{"type": "file_search"}],
             tool_resources={"file_search": {"vector_store_ids": [vs_id]}},
         ), "responses"
     except Exception:
         pass
+    # Oldest: extra_body
     return client.responses.create(
         model=model,
-        input=[{"role": "system", "content": system.strip()},
-               {"role": "user", "content": userq.strip()}],
+        input=[
+            {"role": "system", "content": system.strip()},
+            {"role": "user", "content": userq.strip()},
+        ],
         tools=[{"type": "file_search"}],
         extra_body={"tool_resources": {"file_search": {"vector_store_ids": [vs_id]}}},
     ), "responses"
 
 def ask_with_assistants(client: OpenAI, model: str, vs_id: str, system: str, userq: str):
+    """Assistant temp instance for fallback."""
     asst = client.beta.assistants.create(
         name="Streamlit PDF QA (temp)",
         model=model,
@@ -222,24 +269,33 @@ def ask_with_assistants(client: OpenAI, model: str, vs_id: str, system: str, use
     sleep_s = 0.75
     while True:
         run = client.beta.threads.runs.retrieve(thread_id=thread.id, run_id=run.id)
-        if run.status in {"completed", "failed", "cancelled", "expired"}: break
-        if time.time() > deadline: raise RuntimeError("Run timed out.")
-        time.sleep(sleep_s); sleep_s = min(sleep_s * 1.5, 6.0)
+        if run.status in {"completed", "failed", "cancelled", "expired"}:
+            break
+        if time.time() > deadline:
+            raise RuntimeError("Run timed out.")
+        time.sleep(sleep_s)
+        sleep_s = min(sleep_s * 1.5, 6.0)
 
-    if run.status != "completed": raise RuntimeError(f"Run did not complete: {run.status}")
+    if run.status != "completed":
+        raise RuntimeError(f"Run did not complete: {run.status}")
 
     msgs = client.beta.threads.messages.list(thread_id=thread.id, order="desc", limit=5)
     answer_text = ""
     for m in msgs.data:
-        if m.role != "assistant": continue
+        if m.role != "assistant":
+            continue
         for item in m.content:
             if item.type == "text":
                 answer_text = item.text.value or ""
                 break
-        if answer_text: break
+        if answer_text:
+            break
 
     file_ids = extract_file_ids_from_messages(msgs.data)
-    return {"output_text": answer_text, "_raw": {"messages": msgs, "assistant_id": asst.id, "thread_id": thread.id}}, "assistants", file_ids
+    return {
+        "output_text": answer_text,
+        "_raw": {"messages": msgs, "assistant_id": asst.id, "thread_id": thread.id},
+    }, "assistants", file_ids
 
 def render_sources(client: OpenAI, file_ids: List[str]):
     if not file_ids:
@@ -256,26 +312,37 @@ def render_sources(client: OpenAI, file_ids: List[str]):
 with tab_ask:
     with st.expander("Advanced (system prompt)", expanded=False):
         system_text = st.text_area("System", value=DEFAULT_SYSTEM, height=200, label_visibility="collapsed")
-    question = st.text_input("Your question", placeholder="e.g., In ChenEtAl2020.pdf, which region was imaged and by what method?")
+    question = st.text_input(
+        "Your question",
+        placeholder="e.g., In ChenEtAl2020.pdf, which region was imaged and by what method?",
+    )
     if st.button("Ask", type="primary", use_container_width=True):
         try:
             if not os.getenv("OPENAI_API_KEY"):
-                st.error("Provide your OpenAI API key in the sidebar."); st.stop()
+                st.error("Provide your OpenAI API key in the sidebar.")
+                st.stop()
             if not os.getenv("OPENAI_VECTOR_STORE_ID"):
-                st.error("Provide your Vector Store ID in the sidebar."); st.stop()
+                st.error("Provide your Vector Store ID in the sidebar.")
+                st.stop()
             if not question.strip():
-                st.error("Please enter a question."); st.stop()
+                st.error("Please enter a question.")
+                st.stop()
 
             client = get_client()
             with st.spinner("Thinking..."):
                 try:
-                    resp, _ = ask_with_responses(client, model, os.environ["OPENAI_VECTOR_STORE_ID"], system_text, question)
+                    resp, _ = ask_with_responses(
+                        client, model, os.environ["OPENAI_VECTOR_STORE_ID"], system_text, question
+                    )
                     answer_text = getattr(resp, "output_text", None) or "(no text)"
                     file_ids = extract_file_ids_from_responses(resp)
                     raw_obj = resp
                 except Exception:
-                    resp, _, file_ids = ask_with_assistants(client, model, os.environ["OPENAI_VECTOR_STORE_ID"], system_text, question)
-                    answer_text = resp["output_text"]; raw_obj = resp["_raw"]
+                    resp, _, file_ids = ask_with_assistants(
+                        client, model, os.environ["OPENAI_VECTOR_STORE_ID"], system_text, question
+                    )
+                    answer_text = resp["output_text"]
+                    raw_obj = resp["_raw"]
 
             st.markdown('<div class="answer-card">', unsafe_allow_html=True)
             st.markdown("**Answer**")
@@ -283,23 +350,33 @@ with tab_ask:
             st.markdown('<hr class="soft"/>', unsafe_allow_html=True)
             st.markdown('<span class="small">Sources</span>', unsafe_allow_html=True)
             render_sources(client, file_ids)
-            st.markdown('</div>', unsafe_allow_html=True)
+            st.markdown("</div>", unsafe_allow_html=True)
 
             if show_raw:
                 st.markdown("**Raw**")
-                try: st.write(raw_obj.model_dump())
-                except Exception: st.write(str(raw_obj))
+                try:
+                    st.write(raw_obj.model_dump())
+                except Exception:
+                    st.write(str(raw_obj))
 
         except Exception as e:
             st.error(f"Error: {e}")
 
 # ---------------- Tab: Summarize ALL ----------------
 with tab_all:
-    st.markdown('<div class="card"><h4 class="compact">Summarize every file</h4><div class="small">Runs one focused question per PDF to guarantee coverage.</div></div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="card"><h4 class="compact">Summarize every file</h4><div class="small">Runs one focused question per PDF to guarantee coverage.</div></div>',
+        unsafe_allow_html=True,
+    )
     if st.button("Summarize ALL files (one by one)", use_container_width=True):
         try:
-            if not os.getenv("OPENAI_API_KEY"): st.error("Provide your OpenAI API key in the sidebar."); st.stop()
-            if not os.getenv("OPENAI_VECTOR_STORE_ID"): st.error("Provide your Vector Store ID in the sidebar."); st.stop()
+            if not os.getenv("OPENAI_API_KEY"):
+                st.error("Provide your OpenAI API key in the sidebar.")
+                st.stop()
+            if not os.getenv("OPENAI_VECTOR_STORE_ID"):
+                st.error("Provide your Vector Store ID in the sidebar.")
+                st.stop()
+
             client = get_client()
             vs_id = os.environ["OPENAI_VECTOR_STORE_ID"]
             files = list_vs_files(client, vs_id)
@@ -326,7 +403,7 @@ with tab_all:
                                 resp, _, file_ids = ask_with_assistants(client, model, vs_id, DEFAULT_SYSTEM, per_q)
                                 answer_text = resp["output_text"]
 
-                            st.markdown(f'**{fname}**')
+                            st.markdown(f"**{fname}**")
                             st.write(answer_text)
                             render_sources(client, file_ids)
                             st.markdown('<hr class="soft"/>', unsafe_allow_html=True)
@@ -337,8 +414,12 @@ with tab_all:
 
                 if results_md:
                     all_md = "# Summaries\n\n" + "\n\n".join(results_md)
-                    st.download_button("Download all summaries (Markdown)", data=all_md.encode("utf-8"),
-                                       file_name="summaries.md", mime="text/markdown")
+                    st.download_button(
+                        "Download all summaries (Markdown)",
+                        data=all_md.encode("utf-8"),
+                        file_name="summaries.md",
+                        mime="text/markdown",
+                    )
                 st.success("Done.")
         except Exception as e:
             st.error(f"Error: {e}")
@@ -348,14 +429,19 @@ with tab_files:
     st.markdown('<div class="card"><h4 class="compact">Files in your Vector Store</h4></div>', unsafe_allow_html=True)
     if st.button("Refresh file list"):
         try:
-            if not os.getenv("OPENAI_API_KEY"): st.error("Provide your OpenAI API key in the sidebar."); st.stop()
-            if not os.getenv("OPENAI_VECTOR_STORE_ID"): st.error("Provide your Vector Store ID in the sidebar."); st.stop()
+            if not os.getenv("OPENAI_API_KEY"):
+                st.error("Provide your OpenAI API key in the sidebar.")
+                st.stop()
+            if not os.getenv("OPENAI_VECTOR_STORE_ID"):
+                st.error("Provide your Vector Store ID in the sidebar.")
+                st.stop()
+
             client = get_client()
             files = list_vs_files(client, os.environ["OPENAI_VECTOR_STORE_ID"])
             if not files:
                 st.warning("No files found.")
             else:
-                for _, fname in files: st.markdown(f"- {fname}")
+                for _, fname in files:
+                    st.markdown(f"- {fname}")
         except Exception as e:
             st.error(f"Error: {e}")
-
