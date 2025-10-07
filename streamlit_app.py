@@ -68,11 +68,17 @@ if vector_store_id:
 
 # ---------------- Main UI ----------------
 st.title("📄 PDF Q&A (Vector Store)")
-st.caption("Asks your question against your OpenAI Vector Store and returns a one-sentence, quoted, fully-cited answer.")
+st.caption("Ask about your PDFs or summarize ALL files. Answers include a quote and sources.")
 
 system_text = st.text_area("System instructions (optional override)", value=DEFAULT_SYSTEM, height=220)
 question = st.text_input("Ask a question about your PDFs")
-ask = st.button("Ask")
+colA, colB, colC = st.columns([1, 1, 1])
+with colA:
+    ask = st.button("Ask")
+with colB:
+    list_files_btn = st.button("List files in vector store")
+with colC:
+    summarize_all = st.button("Summarize ALL files (one by one)")
 
 # ---------------- Helpers ----------------
 def extract_file_ids_from_responses(resp) -> List[str]:
@@ -94,7 +100,7 @@ def extract_file_ids_from_responses(resp) -> List[str]:
     return list(file_ids)
 
 def extract_file_ids_from_messages(messages_list) -> List[str]:
-    """For Assistants API messages."""
+    """For Assistants API messages: pull file citations."""
     file_ids: Set[str] = set()
     try:
         for msg in messages_list:
@@ -111,13 +117,29 @@ def extract_file_ids_from_messages(messages_list) -> List[str]:
         pass
     return list(file_ids)
 
-# ---- Responses primary, Assistants fallback ----
+def list_vs_files(client: OpenAI, vector_store_id: str) -> List[Tuple[str, str]]:
+    """Return list of (file_id, filename) for all files in a vector store."""
+    after = None
+    files = []
+    while True:
+        page = client.vector_stores.files.list(vector_store_id=vector_store_id, limit=100, after=after)
+        files.extend(page.data)
+        if not page.has_more:
+            break
+        after = page.last_id
+    out: List[Tuple[str, str]] = []
+    for it in files:
+        try:
+            f = client.files.retrieve(it.id)
+            out.append((it.id, f.filename or it.id))
+        except Exception:
+            out.append((it.id, it.id))
+    return out
+
+# ---- Responses primary (multiple shapes), Assistants fallback ----
 def ask_with_responses(client: OpenAI, model: str, vs_id: str, system: str, userq: str):
-    """
-    Try multiple known argument shapes for Responses+FileSearch.
-    Returns (resp_obj, 'responses') on success, raises otherwise.
-    """
-    # Newer shape (might not exist in your runtime)
+    """Try several known shapes for Responses+FileSearch. Return (resp_obj, 'responses')."""
+    # Newer: file_search top-level
     try:
         return (
             client.responses.create(
@@ -131,41 +153,42 @@ def ask_with_responses(client: OpenAI, model: str, vs_id: str, system: str, user
             ),
             "responses",
         )
-    except Exception as e1:
-        # Older: tool_resources kwarg
-        try:
-            return (
-                client.responses.create(
-                    model=model,
-                    input=[
-                        {"role": "system", "content": system.strip()},
-                        {"role": "user", "content": userq.strip()},
-                    ],
-                    tools=[{"type": "file_search"}],
-                    tool_resources={"file_search": {"vector_store_ids": [vs_id]}},
-                ),
-                "responses",
-            )
-        except Exception as e2:
-            # Very old: stuff it into extra_body
-            return (
-                client.responses.create(
-                    model=model,
-                    input=[
-                        {"role": "system", "content": system.strip()},
-                        {"role": "user", "content": userq.strip()},
-                    ],
-                    tools=[{"type": "file_search"}],
-                    extra_body={"tool_resources": {"file_search": {"vector_store_ids": [vs_id]}}},
-                ),
-                "responses",
-            )
+    except Exception:
+        pass
+
+    # Mid: tool_resources kwarg
+    try:
+        return (
+            client.responses.create(
+                model=model,
+                input=[
+                    {"role": "system", "content": system.strip()},
+                    {"role": "user", "content": userq.strip()},
+                ],
+                tools=[{"type": "file_search"}],
+                tool_resources={"file_search": {"vector_store_ids": [vs_id]}},
+            ),
+            "responses",
+        )
+    except Exception:
+        pass
+
+    # Oldest: extra_body
+    return (
+        client.responses.create(
+            model=model,
+            input=[
+                {"role": "system", "content": system.strip()},
+                {"role": "user", "content": userq.strip()},
+            ],
+            tools=[{"type": "file_search"}],
+            extra_body={"tool_resources": {"file_search": {"vector_store_ids": [vs_id]}}},
+        ),
+        "responses",
+    )
 
 def ask_with_assistants(client: OpenAI, model: str, vs_id: str, system: str, userq: str):
-    """
-    Use Assistants API (beta) as a compatibility fallback.
-    """
-    # Create or reuse a tiny ephemeral assistant
+    """Compatibility fallback using Assistants API (beta)."""
     asst = client.beta.assistants.create(
         name="Streamlit PDF QA (temp)",
         model=model,
@@ -207,54 +230,123 @@ def ask_with_assistants(client: OpenAI, model: str, vs_id: str, system: str, use
     file_ids = extract_file_ids_from_messages(msgs.data)
     return {"output_text": answer_text, "_raw": {"messages": msgs, "assistant_id": asst.id, "thread_id": thread.id}}, "assistants", file_ids
 
-# ---------------- Action ----------------
-if ask:
-    if not os.getenv("OPENAI_API_KEY"):
-        st.error("Please provide your OpenAI API key.")
-        st.stop()
-    if not os.getenv("OPENAI_VECTOR_STORE_ID"):
-        st.error("Please provide your Vector Store ID.")
-        st.stop()
-    if not question.strip():
-        st.error("Please enter a question.")
-        st.stop()
+def render_sources(client: OpenAI, file_ids: List[str]):
+    if not file_ids:
+        st.info("No file citations returned (or none detected).")
+        return
+    st.markdown("**Sources**")
+    for fid in file_ids[:10]:
+        try:
+            f = client.files.retrieve(fid)
+            st.write(f"- {getattr(f, 'filename', fid) or fid}")
+        except Exception:
+            st.write(f"- {fid}")
 
-    client = get_client()
-
+# ---------------- Actions ----------------
+if list_files_btn:
     try:
+        client = get_client()
+        vs_id = os.environ.get("OPENAI_VECTOR_STORE_ID", "")
+        if not vs_id:
+            st.error("Please provide your Vector Store ID.")
+        else:
+            files = list_vs_files(client, vs_id)
+            if not files:
+                st.warning("No files found in this vector store.")
+            else:
+                st.markdown("### Files in vector store")
+                for _, fname in files:
+                    st.write(f"- {fname}")
+    except Exception as e:
+        st.error(f"Error: {e}")
+
+if ask:
+    try:
+        if not os.getenv("OPENAI_API_KEY"):
+            st.error("Please provide your OpenAI API key.")
+            st.stop()
+        if not os.getenv("OPENAI_VECTOR_STORE_ID"):
+            st.error("Please provide your Vector Store ID.")
+            st.stop()
+        if not question.strip():
+            st.error("Please enter a question.")
+            st.stop()
+
+        client = get_client()
+
         with st.spinner("Thinking..."):
-            # Try Responses API first (with several shapes)
+            # Try Responses first; if it fails, fallback to Assistants
             try:
                 resp, mode = ask_with_responses(client, model, os.environ["OPENAI_VECTOR_STORE_ID"], system_text, question)
                 answer_text = getattr(resp, "output_text", None) or "(no text)"
                 file_ids = extract_file_ids_from_responses(resp)
                 raw_obj = resp
             except Exception:
-                # Fallback to Assistants API
                 resp, mode, file_ids = ask_with_assistants(client, model, os.environ["OPENAI_VECTOR_STORE_ID"], system_text, question)
                 answer_text = resp["output_text"]
                 raw_obj = resp["_raw"]
 
-        st.markdown(f"### Answer\n{answer_text}")
-
-        # Basic Sources section (filenames from citation IDs)
-        if file_ids:
-            st.markdown("### Sources")
-            for fid in file_ids[:5]:
-                try:
-                    f = client.files.retrieve(fid)
-                    st.write(f"- {getattr(f, 'filename', fid) or fid}")
-                except Exception:
-                    st.write(f"- {fid}")
-        else:
-            st.info("No file citations returned (or none detected).")
+        st.subheader("Answer")
+        st.write(answer_text)
+        st.subheader("Sources")
+        render_sources(client, file_ids)
 
         if show_raw:
-            st.markdown("### Raw response")
+            st.markdown("### Raw")
             try:
                 st.write(raw_obj.model_dump())
             except Exception:
                 st.write(str(raw_obj))
+
+    except Exception as e:
+        st.error(f"Error: {e}")
+
+if summarize_all:
+    try:
+        if not os.getenv("OPENAI_API_KEY"):
+            st.error("Please provide your OpenAI API key.")
+            st.stop()
+        if not os.getenv("OPENAI_VECTOR_STORE_ID"):
+            st.error("Please provide your Vector Store ID.")
+            st.stop()
+
+        client = get_client()
+        vs_id = os.environ["OPENAI_VECTOR_STORE_ID"]
+        files = list_vs_files(client, vs_id)
+
+        if not files:
+            st.warning("No files found in this vector store.")
+        else:
+            st.subheader("Summaries")
+            progress = st.progress(0.0)
+            total = len(files)
+            for idx, (fid, fname) in enumerate(files, start=1):
+                # Per-file prompt (nudges model to use only that file)
+                per_q = (
+                    f"Summarize the paper **{fname}** in 2–3 sentences. "
+                    f"Use only content from {fname}. Include one short quote and end with "
+                    f"[{fname} p.— §—]."
+                )
+                with st.spinner(f"Summarizing {fname} ({idx}/{total})..."):
+                    try:
+                        try:
+                            resp, mode = ask_with_responses(client, model, vs_id, system_text, per_q)
+                            answer_text = getattr(resp, "output_text", None) or "(no text)"
+                            file_ids = extract_file_ids_from_responses(resp)
+                            raw_obj = resp
+                        except Exception:
+                            resp, mode, file_ids = ask_with_assistants(client, model, vs_id, system_text, per_q)
+                            answer_text = resp["output_text"]
+                            raw_obj = resp["_raw"]
+
+                        st.markdown(f"**{fname}**")
+                        st.write(answer_text)
+                        render_sources(client, file_ids)
+                        st.markdown("---")
+                    except Exception as inner_e:
+                        st.error(f"{fname}: {inner_e}")
+                progress.progress(idx / total)
+            st.success("Done.")
 
     except Exception as e:
         st.error(f"Error: {e}")
