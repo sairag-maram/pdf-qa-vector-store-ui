@@ -1,25 +1,25 @@
 #!/usr/bin/env python3
 import os
-import streamlit as st
 from pathlib import Path
 from typing import List, Set
 
+import streamlit as st
 from dotenv import load_dotenv
 from openai import OpenAI
 
-# ---------- setup ----------
-st.set_page_config(page_title="PDF Q&A", page_icon="📄", layout="centered")
+# ---------------- Setup ----------------
+st.set_page_config(page_title="PDF Q&A (Vector Store)", page_icon="📄", layout="centered")
 
-# pull from Streamlit Secrets (cloud) if present
+# Pull from Streamlit Secrets (cloud) if present
 if "OPENAI_API_KEY" in st.secrets:
     os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_API_KEY"]
 if "OPENAI_VECTOR_STORE_ID" in st.secrets:
     os.environ["OPENAI_VECTOR_STORE_ID"] = st.secrets["OPENAI_VECTOR_STORE_ID"]
 
-# load .env for local dev
+# Load .env for local dev
 load_dotenv(Path(__file__).with_name(".env"))
 
-def get_client():
+def get_client() -> OpenAI:
     if not os.getenv("OPENAI_API_KEY"):
         raise RuntimeError("Missing OPENAI_API_KEY (set in .env or Streamlit Secrets).")
     return OpenAI()
@@ -43,18 +43,27 @@ ANSWER FORMAT & CITATION RULES
   No direct evidence found in the provided files.
 """
 
-# ---------- sidebar ----------
+# ---------------- Sidebar ----------------
 st.sidebar.header("Settings")
 api_key = st.sidebar.text_input("OPENAI_API_KEY", type="password", value=os.getenv("OPENAI_API_KEY", ""))
 vector_store_id = st.sidebar.text_input("OPENAI_VECTOR_STORE_ID", value=os.getenv("OPENAI_VECTOR_STORE_ID", ""))
 model = st.sidebar.text_input("Model", value="gpt-4o-mini")
 show_raw = st.sidebar.checkbox("Show raw response", value=False)
 
+# Show SDK version for debugging
+try:
+    import openai as _openai_pkg
+    st.sidebar.caption(f"openai version: {_openai_pkg.__version__}")
+except Exception:
+    pass
+
+# Update env if user types new values
 if api_key:
     os.environ["OPENAI_API_KEY"] = api_key
 if vector_store_id:
     os.environ["OPENAI_VECTOR_STORE_ID"] = vector_store_id
 
+# ---------------- Main UI ----------------
 st.title("📄 PDF Q&A (Vector Store)")
 st.caption("Asks your question against your OpenAI Vector Store and returns a one-sentence, quoted, fully-cited answer.")
 
@@ -62,7 +71,9 @@ system_text = st.text_area("System instructions (optional override)", value=DEFA
 question = st.text_input("Ask a question about your PDFs")
 ask = st.button("Ask")
 
+# ---------------- Helpers ----------------
 def extract_file_ids(resp) -> List[str]:
+    """Collect file IDs from file_citation annotations in a Responses result."""
     file_ids: Set[str] = set()
     try:
         for block in resp.output:
@@ -79,6 +90,7 @@ def extract_file_ids(resp) -> List[str]:
         pass
     return list(file_ids)
 
+# ---------------- Action ----------------
 if ask:
     if not os.getenv("OPENAI_API_KEY"):
         st.error("Please provide your OpenAI API key.")
@@ -91,20 +103,33 @@ if ask:
         st.stop()
 
     client = get_client()
+
     try:
         with st.spinner("Thinking..."):
-            resp = client.responses.create(
+            common_args = dict(
                 model=model,
                 tools=[{"type": "file_search"}],
-                tool_resources={"file_search": {"vector_store_ids": [os.environ["OPENAI_VECTOR_STORE_ID"]]}},
                 input=[
                     {"role": "system", "content": system_text.strip()},
                     {"role": "user", "content": question.strip()},
                 ],
             )
 
+            # ---- New SDKs support tool_resources; older ones need extra_body ----
+            try:
+                resp = client.responses.create(
+                    **common_args,
+                    tool_resources={"file_search": {"vector_store_ids": [os.environ["OPENAI_VECTOR_STORE_ID"]]}}
+                )
+            except TypeError:
+                resp = client.responses.create(
+                    **common_args,
+                    extra_body={"tool_resources": {"file_search": {"vector_store_ids": [os.environ["OPENAI_VECTOR_STORE_ID"]]}}}
+                )
+
         st.markdown(f"### Answer\n{resp.output_text or '(no text)'}")
 
+        # Basic Sources section (filenames from citation IDs)
         file_ids = extract_file_ids(resp)
         if file_ids:
             st.markdown("### Sources")
