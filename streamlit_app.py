@@ -20,7 +20,8 @@ if "OPENAI_VECTOR_STORE_ID" in st.secrets:
 load_dotenv(Path(__file__).with_name(".env"))
 
 def get_client() -> OpenAI:
-    if not os.getenv("OPENAI_API_KEY"):
+    key = os.getenv("OPENAI_API_KEY")
+    if not key:
         raise RuntimeError("Missing OPENAI_API_KEY (set in .env or Streamlit Secrets).")
     return OpenAI()
 
@@ -50,7 +51,7 @@ vector_store_id = st.sidebar.text_input("OPENAI_VECTOR_STORE_ID", value=os.geten
 model = st.sidebar.text_input("Model", value="gpt-4o-mini")
 show_raw = st.sidebar.checkbox("Show raw response", value=False)
 
-# Show SDK version for debugging
+# Show SDK version (helps debugging)
 try:
     import openai as _openai_pkg
     st.sidebar.caption(f"openai version: {_openai_pkg.__version__}")
@@ -106,28 +107,19 @@ if ask:
 
     try:
         with st.spinner("Thinking..."):
-            common_args = dict(
+            # New shape: file_search is a top-level argument
+            resp = client.responses.create(
                 model=model,
-                tools=[{"type": "file_search"}],
                 input=[
                     {"role": "system", "content": system_text.strip()},
                     {"role": "user", "content": question.strip()},
                 ],
+                tools=[{"type": "file_search"}],
+                file_search={"vector_store_ids": [os.environ["OPENAI_VECTOR_STORE_ID"]]},
             )
 
-            # ---- New SDKs support tool_resources; older ones need extra_body ----
-            try:
-                resp = client.responses.create(
-                    **common_args,
-                    tool_resources={"file_search": {"vector_store_ids": [os.environ["OPENAI_VECTOR_STORE_ID"]]}}
-                )
-            except TypeError:
-                resp = client.responses.create(
-                    **common_args,
-                    extra_body={"tool_resources": {"file_search": {"vector_store_ids": [os.environ["OPENAI_VECTOR_STORE_ID"]]}}}
-                )
-
-        st.markdown(f"### Answer\n{resp.output_text or '(no text)'}")
+        answer_text = getattr(resp, "output_text", None) or "(no text)"
+        st.markdown(f"### Answer\n{answer_text}")
 
         # Basic Sources section (filenames from citation IDs)
         file_ids = extract_file_ids(resp)
