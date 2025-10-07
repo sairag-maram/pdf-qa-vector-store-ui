@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 import os
+import time
 from pathlib import Path
-from typing import List, Set
+from typing import List, Set, Tuple
 
 import streamlit as st
 from dotenv import load_dotenv
 from openai import OpenAI
+from openai.types.beta.threads import Run
 
 # ---------------- Setup ----------------
 st.set_page_config(page_title="PDF Q&A (Vector Store)", page_icon="📄", layout="centered")
@@ -73,7 +75,7 @@ question = st.text_input("Ask a question about your PDFs")
 ask = st.button("Ask")
 
 # ---------------- Helpers ----------------
-def extract_file_ids(resp) -> List[str]:
+def extract_file_ids_from_responses(resp) -> List[str]:
     """Collect file IDs from file_citation annotations in a Responses result."""
     file_ids: Set[str] = set()
     try:
@@ -91,6 +93,120 @@ def extract_file_ids(resp) -> List[str]:
         pass
     return list(file_ids)
 
+def extract_file_ids_from_messages(messages_list) -> List[str]:
+    """For Assistants API messages."""
+    file_ids: Set[str] = set()
+    try:
+        for msg in messages_list:
+            if getattr(msg, "role", "") != "assistant":
+                continue
+            for item in (msg.content or []):
+                if getattr(item, "type", None) == "text":
+                    for ann in (getattr(item.text, "annotations", []) or []):
+                        if getattr(ann, "type", None) == "file_citation":
+                            fid = getattr(ann.file_citation, "file_id", None)
+                            if fid:
+                                file_ids.add(fid)
+    except Exception:
+        pass
+    return list(file_ids)
+
+# ---- Responses primary, Assistants fallback ----
+def ask_with_responses(client: OpenAI, model: str, vs_id: str, system: str, userq: str):
+    """
+    Try multiple known argument shapes for Responses+FileSearch.
+    Returns (resp_obj, 'responses') on success, raises otherwise.
+    """
+    # Newer shape (might not exist in your runtime)
+    try:
+        return (
+            client.responses.create(
+                model=model,
+                input=[
+                    {"role": "system", "content": system.strip()},
+                    {"role": "user", "content": userq.strip()},
+                ],
+                tools=[{"type": "file_search"}],
+                file_search={"vector_store_ids": [vs_id]},
+            ),
+            "responses",
+        )
+    except Exception as e1:
+        # Older: tool_resources kwarg
+        try:
+            return (
+                client.responses.create(
+                    model=model,
+                    input=[
+                        {"role": "system", "content": system.strip()},
+                        {"role": "user", "content": userq.strip()},
+                    ],
+                    tools=[{"type": "file_search"}],
+                    tool_resources={"file_search": {"vector_store_ids": [vs_id]}},
+                ),
+                "responses",
+            )
+        except Exception as e2:
+            # Very old: stuff it into extra_body
+            return (
+                client.responses.create(
+                    model=model,
+                    input=[
+                        {"role": "system", "content": system.strip()},
+                        {"role": "user", "content": userq.strip()},
+                    ],
+                    tools=[{"type": "file_search"}],
+                    extra_body={"tool_resources": {"file_search": {"vector_store_ids": [vs_id]}}},
+                ),
+                "responses",
+            )
+
+def ask_with_assistants(client: OpenAI, model: str, vs_id: str, system: str, userq: str):
+    """
+    Use Assistants API (beta) as a compatibility fallback.
+    """
+    # Create or reuse a tiny ephemeral assistant
+    asst = client.beta.assistants.create(
+        name="Streamlit PDF QA (temp)",
+        model=model,
+        instructions=system.strip(),
+        tools=[{"type": "file_search"}],
+        tool_resources={"file_search": {"vector_store_ids": [vs_id]}},
+    )
+    thread = client.beta.threads.create()
+    client.beta.threads.messages.create(thread_id=thread.id, role="user", content=userq.strip())
+    run: Run = client.beta.threads.runs.create(thread_id=thread.id, assistant_id=asst.id)
+
+    # Poll
+    deadline = time.time() + 60 * 6
+    sleep_s = 0.75
+    while True:
+        run = client.beta.threads.runs.retrieve(thread_id=thread.id, run_id=run.id)
+        if run.status in {"completed", "failed", "cancelled", "expired"}:
+            break
+        if time.time() > deadline:
+            raise RuntimeError("Run timed out.")
+        time.sleep(sleep_s)
+        sleep_s = min(sleep_s * 1.5, 6.0)
+
+    if run.status != "completed":
+        raise RuntimeError(f"Run did not complete: {run.status}")
+
+    msgs = client.beta.threads.messages.list(thread_id=thread.id, order="desc", limit=5)
+    answer_text = ""
+    for m in msgs.data:
+        if m.role != "assistant":
+            continue
+        for item in m.content:
+            if item.type == "text":
+                answer_text = item.text.value or ""
+                break
+        if answer_text:
+            break
+
+    file_ids = extract_file_ids_from_messages(msgs.data)
+    return {"output_text": answer_text, "_raw": {"messages": msgs, "assistant_id": asst.id, "thread_id": thread.id}}, "assistants", file_ids
+
 # ---------------- Action ----------------
 if ask:
     if not os.getenv("OPENAI_API_KEY"):
@@ -107,22 +223,21 @@ if ask:
 
     try:
         with st.spinner("Thinking..."):
-            # New shape: file_search is a top-level argument
-            resp = client.responses.create(
-                model=model,
-                input=[
-                    {"role": "system", "content": system_text.strip()},
-                    {"role": "user", "content": question.strip()},
-                ],
-                tools=[{"type": "file_search"}],
-                file_search={"vector_store_ids": [os.environ["OPENAI_VECTOR_STORE_ID"]]},
-            )
+            # Try Responses API first (with several shapes)
+            try:
+                resp, mode = ask_with_responses(client, model, os.environ["OPENAI_VECTOR_STORE_ID"], system_text, question)
+                answer_text = getattr(resp, "output_text", None) or "(no text)"
+                file_ids = extract_file_ids_from_responses(resp)
+                raw_obj = resp
+            except Exception:
+                # Fallback to Assistants API
+                resp, mode, file_ids = ask_with_assistants(client, model, os.environ["OPENAI_VECTOR_STORE_ID"], system_text, question)
+                answer_text = resp["output_text"]
+                raw_obj = resp["_raw"]
 
-        answer_text = getattr(resp, "output_text", None) or "(no text)"
         st.markdown(f"### Answer\n{answer_text}")
 
         # Basic Sources section (filenames from citation IDs)
-        file_ids = extract_file_ids(resp)
         if file_ids:
             st.markdown("### Sources")
             for fid in file_ids[:5]:
@@ -136,7 +251,10 @@ if ask:
 
         if show_raw:
             st.markdown("### Raw response")
-            st.write(resp.model_dump())
+            try:
+                st.write(raw_obj.model_dump())
+            except Exception:
+                st.write(str(raw_obj))
 
     except Exception as e:
         st.error(f"Error: {e}")
