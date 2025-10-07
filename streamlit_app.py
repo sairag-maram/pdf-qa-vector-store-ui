@@ -17,61 +17,56 @@ st.set_page_config(
     menu_items={"Get help": None, "Report a bug": None, "About": "PDF Q&A on OpenAI Vector Stores"},
 )
 
-# --- Stanford color theme (Cardinal / Bright Red / Cool Gray)
+# --- Stanford colors, but with HIGH CONTRAST + neutral backgrounds
+# (keep Streamlit theme text colors; only accent & borders are customized)
 st.markdown("""
 <style>
-:root {
-  --card-bg: rgba(140,21,21,0.05);     /* Cardinal tint */
-  --chip-bg: rgba(177,4,14,0.10);      /* Bright red tint */
-  --border: rgba(140,21,21,0.35);      /* Cardinal border */
-  --muted: #4D4F53;                    /* Stanford Cool Gray */
-  --accent: #8C1515;                   /* Cardinal */
-  --accent-2: #B1040E;                 /* Bright Red */
+:root{
+  --accent:#8C1515;          /* Stanford Cardinal */
+  --accent-2:#B1040E;        /* Bright Red */
+  --border:#E5E7EB;          /* Neutral light gray */
+  --muted:#4D4F53;           /* Stanford Cool Gray */
+  --card-bg:#FFFFFF;         /* White card */
+  --chip-bg:#FBE9EA;         /* Very light cardinal tint */
 }
 
-/* subtle page background with Cardinal haze */
-html, body, .stApp {
-  background: linear-gradient(180deg, rgba(140,21,21,.03), transparent 25%) !important;
-}
-
-/* header + kicker */
+/* Header */
 div.app-header{display:flex;gap:.75rem;align-items:center;margin:0 0 .5rem 0}
 div.app-header h1{font-weight:800;margin:0;color:var(--accent)}
-div.kicker{color:var(--muted);font-size:.95rem;margin:-.25rem 0 .5rem 0}
+div.kicker{color:var(--muted);font-size:.95rem;margin:-.25rem 0 .75rem 0}
 
-/* cards */
-div.card{border:1px solid var(--border);background:var(--card-bg);padding:16px 18px;border-radius:16px;box-shadow:0 4px 18px rgba(140,21,21,.10)}
-div.answer-card{border:1px solid var(--border);background:var(--card-bg);padding:16px 18px;border-radius:16px;margin:.5rem 0 1rem 0;box-shadow:0 4px 18px rgba(140,21,21,.10)}
+/* Cards (white, subtle shadow & border) */
+div.card{border:1px solid var(--border);background:var(--card-bg);padding:16px 18px;border-radius:14px;box-shadow:0 1px 8px rgba(0,0,0,.06)}
+div.answer-card{border:1px solid var(--border);background:var(--card-bg);padding:16px 18px;border-radius:14px;margin:.5rem 0 1rem 0;box-shadow:0 1px 8px rgba(0,0,0,.06)}
 h4.compact{margin:.1rem 0 .6rem 0}
 .small{color:var(--muted);font-size:.9rem}
 
-/* chips (source tags) */
-span.chip{display:inline-block;padding:4px 10px;border-radius:999px;background:var(--chip-bg);margin-right:6px;font-size:.85rem;color:var(--accent)}
+/* Chips for sources */
+span.chip{display:inline-block;padding:4px 10px;border-radius:999px;background:var(--chip-bg);
+          margin-right:6px;font-size:.85rem;color:var(--accent);border:1px solid #F3C9CB}
 
-/* soft divider */
-hr.soft{border:none;height:1px;background:var(--border);margin:.65rem 0}
+/* Divider */
+hr.soft{border:none;height:1px;background:#EDF2F7;margin:.65rem 0}
 
-/* primary actions: buttons + download buttons */
+/* Primary buttons */
 div.stButton > button, .stDownloadButton > button{
-  background: var(--accent); color:#fff; border:1px solid var(--accent-2);
-  border-radius:12px; padding:.55rem .9rem; font-weight:600;
+  background: var(--accent); color:#fff; border:1px solid var(--accent); 
+  border-radius:10px; padding:.55rem .9rem; font-weight:600;
 }
 div.stButton > button:hover, .stDownloadButton > button:hover{
   background: var(--accent-2); border-color: var(--accent-2);
 }
 
-/* tabs with Cardinal underlines */
-.stTabs [data-baseweb="tab"]{
-  color: var(--muted); border-bottom:2px solid transparent; padding-bottom:.35rem;
-}
+/* Tabs: cardinal underline for active */
+.stTabs [data-baseweb="tab"]{border-bottom:2px solid transparent;padding-bottom:.35rem}
 .stTabs [data-baseweb="tab"][aria-selected="true"]{
-  color: var(--accent); border-bottom-color: var(--accent); font-weight:700;
+  color:var(--accent); border-bottom-color:var(--accent); font-weight:700;
 }
 
-/* progress bar in Cardinal */
-[data-testid="stProgressBar"] > div > div > div{ background: var(--accent) !important; }
+/* Progress bar in Cardinal */
+[data-testid="stProgressBar"] > div > div > div { background: var(--accent) !important; }
 
-/* link color */
+/* Links */
 a{color:var(--accent-2)}
 </style>
 """, unsafe_allow_html=True)
@@ -117,7 +112,6 @@ vector_store_id = st.sidebar.text_input("OPENAI_VECTOR_STORE_ID", value=os.geten
 model = st.sidebar.text_input("Model", value="gpt-4o-mini")
 show_raw = st.sidebar.checkbox("Show raw response", value=False)
 
-# Version chip
 try:
     import openai as _openai_pkg
     st.sidebar.caption(f"openai version: {_openai_pkg.__version__}")
@@ -134,7 +128,7 @@ st.markdown('<div class="kicker">Ask questions against your OpenAI Vector Store,
 # ---------------- Tabs ----------------
 tab_ask, tab_all, tab_files = st.tabs(["💬 Ask", "🗂️ Summarize ALL", "📁 Files"])
 
-# ---------------- Helpers (citations, files, dual-API logic) ----------------
+# ---------------- Helpers ----------------
 def extract_file_ids_from_responses(resp) -> List[str]:
     file_ids: Set[str] = set()
     try:
@@ -182,8 +176,8 @@ def list_vs_files(client: OpenAI, vector_store_id: str) -> List[Tuple[str, str]]
             out.append((it.id, it.id))
     return out
 
+# Responses-first (supporting different shapes), Assistants fallback
 def ask_with_responses(client: OpenAI, model: str, vs_id: str, system: str, userq: str):
-    # 1) Newest: file_search top-level
     try:
         return client.responses.create(
             model=model,
@@ -194,7 +188,6 @@ def ask_with_responses(client: OpenAI, model: str, vs_id: str, system: str, user
         ), "responses"
     except Exception:
         pass
-    # 2) Mid: tool_resources kwarg
     try:
         return client.responses.create(
             model=model,
@@ -205,7 +198,6 @@ def ask_with_responses(client: OpenAI, model: str, vs_id: str, system: str, user
         ), "responses"
     except Exception:
         pass
-    # 3) Oldest: extra_body
     return client.responses.create(
         model=model,
         input=[{"role": "system", "content": system.strip()},
@@ -366,3 +358,4 @@ with tab_files:
                 for _, fname in files: st.markdown(f"- {fname}")
         except Exception as e:
             st.error(f"Error: {e}")
+
