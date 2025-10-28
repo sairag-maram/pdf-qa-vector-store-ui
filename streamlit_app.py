@@ -11,7 +11,7 @@ Tabs:
 
 Auth:
 - Optional authentication - users can browse but need to login to upload
-- streamlit-authenticator with secrets shim + sign-up functionality
+- Sign-up enabled for all configurations
 """
 
 import os
@@ -108,43 +108,33 @@ def save_config(config):
         yaml.dump(config, file, default_flow_style=False)
 
 def build_authenticator():
-    # Try to load from secrets first
+    """Build authenticator - always use config file for sign-up capability"""
+    config = load_config()
+    
+    # If secrets exist, merge them into config
     if "auth" in st.secrets:
         raw_auth = _to_plain_dict(st.secrets["auth"])
-        cookie_cfg = _to_plain_dict(raw_auth.get("cookie", {}))
-        creds = _to_plain_dict(raw_auth.get("credentials", {"usernames": {}}))
-
-        if "usernames" not in creds:
-            creds["usernames"] = {}
-
-        cleaned = {"usernames": {}}
-        for uname, u in creds["usernames"].items():
-            cleaned["usernames"][uname] = {
-                "name": u.get("name", uname),
-                "email": u.get("email", ""),
-                "password": u.get("password", ""),
-            }
-
-        authenticator = stauth.Authenticate(
-            credentials=cleaned,
-            cookie_name=cookie_cfg.get("name", "vs_app_session"),
-            key=cookie_cfg.get("key", "cookie-key"),
-            cookie_expiry_days=int(cookie_cfg.get("expiry_days", 14)),
-        )
-        return authenticator, True
+        if "credentials" in raw_auth and "usernames" in raw_auth["credentials"]:
+            # Merge secrets users into config
+            for username, user_data in raw_auth["credentials"]["usernames"].items():
+                if username not in config['credentials']['usernames']:
+                    config['credentials']['usernames'][username] = {
+                        'name': user_data.get('name', username),
+                        'email': user_data.get('email', ''),
+                        'password': user_data.get('password', '')
+                    }
+            save_config(config)
     
-    # Otherwise use config file
-    config = load_config()
     authenticator = stauth.Authenticate(
         credentials=config['credentials'],
         cookie_name=config['cookie']['name'],
         key=config['cookie']['key'],
         cookie_expiry_days=config['cookie']['expiry_days']
     )
-    return authenticator, False
+    return authenticator
 
 # ----------------------------- Authentication -----------------------------
-authenticator, using_secrets = build_authenticator()
+authenticator = build_authenticator()
 
 # Initialize session state for showing auth forms
 if 'show_signup' not in st.session_state:
@@ -185,24 +175,53 @@ with st.sidebar:
             st.markdown("---")
             st.markdown("#### Sign Up")
             
-            try:
-                if not using_secrets:  # Only allow signup with config file
-                    if authenticator.register_user('Register user', location='sidebar', preauthorization=False):
-                        st.success('User registered successfully!')
-                        # Save the updated config
+            with st.form("register_form"):
+                st.text_input("Username", key="reg_username")
+                st.text_input("Full Name", key="reg_name")
+                st.text_input("Email", key="reg_email")
+                st.text_input("Password", type="password", key="reg_password")
+                st.text_input("Confirm Password", type="password", key="reg_password2")
+                
+                col1, col2 = st.columns(2)
+                submit = col1.form_submit_button("Register", use_container_width=True)
+                cancel = col2.form_submit_button("Cancel", use_container_width=True)
+                
+                if submit:
+                    username_new = st.session_state.reg_username
+                    name_new = st.session_state.reg_name
+                    email_new = st.session_state.reg_email
+                    password_new = st.session_state.reg_password
+                    password2_new = st.session_state.reg_password2
+                    
+                    # Validation
+                    if not username_new or not name_new or not email_new or not password_new:
+                        st.error("All fields are required!")
+                    elif password_new != password2_new:
+                        st.error("Passwords don't match!")
+                    elif len(password_new) < 6:
+                        st.error("Password must be at least 6 characters!")
+                    else:
+                        # Check if username exists
                         config = load_config()
-                        config['credentials'] = authenticator.credentials
-                        save_config(config)
-                        st.session_state.show_signup = False
-                        st.rerun()
-                else:
-                    st.warning("Sign-up is disabled when using secrets configuration.")
-            except Exception as e:
-                st.error(f"Registration error: {e}")
-            
-            if st.button("Back to Login", use_container_width=True):
-                st.session_state.show_signup = False
-                st.rerun()
+                        if username_new in config['credentials']['usernames']:
+                            st.error("Username already exists!")
+                        else:
+                            # Hash password and save
+                            hashed_pwd = stauth.Hasher([password_new]).generate()[0]
+                            config['credentials']['usernames'][username_new] = {
+                                'name': name_new,
+                                'email': email_new,
+                                'password': hashed_pwd
+                            }
+                            save_config(config)
+                            st.success(f"Account created for {username_new}! Please login.")
+                            st.session_state.show_signup = False
+                            time.sleep(1)
+                            st.rerun()
+                
+                if cancel:
+                    st.session_state.show_signup = False
+                    st.rerun()
 
 # Set username for non-authenticated users
 if not auth_status:
