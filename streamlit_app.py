@@ -112,34 +112,34 @@ def build_authenticator():
 # ----------------------------- Authentication -----------------------------
 authenticator, using_secrets = build_authenticator()
 
-# The login method must be called with the correct parameters
-# Different versions of streamlit-authenticator have different APIs
-try:
-    # Try calling login with just the location parameter (newer versions)
-    name, auth_status, username = authenticator.login(location='sidebar')
-except TypeError as e:
-    # If that fails, try with form_name parameter (some versions)
-    try:
-        name, auth_status, username = authenticator.login('Login', 'sidebar')
-    except Exception as e2:
-        # Last resort: try with key parameter
-        try:
-            name, auth_status, username = authenticator.login(key='login_form', location='sidebar')
-        except Exception as e3:
-            st.error(f"Authentication error: {str(e3)}")
-            st.error("Please check your streamlit-authenticator version. Try: pip install streamlit-authenticator==0.2.3")
-            st.stop()
+# Call the login widget - this must be done ONCE and outside any context
+# The method returns a tuple: (name, authentication_status, username)
+login_result = authenticator.login(fields={'Form name': 'Login'}, location='sidebar')
 
-# Now we can use the sidebar for status messages
+# Handle the result - check if it's None or a tuple
+if login_result is None:
+    # Login hasn't been attempted yet or returned None
+    st.stop()
+elif isinstance(login_result, tuple) and len(login_result) == 3:
+    name, auth_status, username = login_result
+else:
+    # Unexpected return value
+    st.error("Authentication system error. Please refresh the page.")
+    st.stop()
+
+# Display status messages in sidebar
 with st.sidebar:
     if auth_status:
         st.success(f"Hello, {name}!")
         authenticator.logout("Logout", "sidebar")
     elif auth_status is False:
         st.error("Username/password is incorrect.")
+        st.stop()
     elif auth_status is None:
-        st.info("Please log in to continue.")
+        st.info("Please enter your username and password.")
+        st.stop()
 
+# If we get here, user is authenticated
 if not auth_status:
     st.stop()
 
