@@ -10,7 +10,8 @@ Tabs:
 - 📚 Library: browse uploaded files with who/when (backed by local SQLite library.db)
 
 Auth:
-- streamlit-authenticator with secrets shim (secrets are read-only, so we deep-copy)
+- Optional authentication - users can browse but need to login to upload
+- streamlit-authenticator with secrets shim + sign-up functionality
 """
 
 import os
@@ -19,6 +20,7 @@ import sqlite3
 from datetime import datetime
 from pathlib import Path
 from typing import List, Set, Tuple
+import yaml
 
 import streamlit as st
 import streamlit_authenticator as stauth
@@ -63,6 +65,8 @@ if "OPENAI_VECTOR_STORE_ID" in st.secrets:
 load_dotenv(Path(__file__).with_name(".env"))
 
 # ----------------------------- Helpers: Auth -----------------------------
+CONFIG_FILE = Path("config.yaml")
+
 def _to_plain_dict(obj):
     """Recursively convert Mapping-like obj (incl. Streamlit Secrets sections) to plain dict."""
     try:
@@ -71,8 +75,40 @@ def _to_plain_dict(obj):
         return obj
     return {k: _to_plain_dict(v) for k, v in items}
 
+def load_config():
+    """Load or create config file for user credentials"""
+    if CONFIG_FILE.exists():
+        with open(CONFIG_FILE, 'r') as file:
+            return yaml.safe_load(file)
+    else:
+        # Create default config
+        hashed = stauth.Hasher(["demo"]).generate()
+        config = {
+            'credentials': {
+                'usernames': {
+                    'demo': {
+                        'name': 'Demo User',
+                        'password': hashed[0],
+                        'email': 'demo@example.com'
+                    }
+                }
+            },
+            'cookie': {
+                'name': 'vs_app_session',
+                'key': 'cookie-key-12345',
+                'expiry_days': 14
+            }
+        }
+        save_config(config)
+        return config
+
+def save_config(config):
+    """Save config to file"""
+    with open(CONFIG_FILE, 'w') as file:
+        yaml.dump(config, file, default_flow_style=False)
+
 def build_authenticator():
-    # From secrets if configured
+    # Try to load from secrets first
     if "auth" in st.secrets:
         raw_auth = _to_plain_dict(st.secrets["auth"])
         cookie_cfg = _to_plain_dict(raw_auth.get("cookie", {}))
@@ -86,7 +122,7 @@ def build_authenticator():
             cleaned["usernames"][uname] = {
                 "name": u.get("name", uname),
                 "email": u.get("email", ""),
-                "password": u.get("password", ""),  # bcrypt hash
+                "password": u.get("password", ""),
             }
 
         authenticator = stauth.Authenticate(
@@ -96,52 +132,82 @@ def build_authenticator():
             cookie_expiry_days=int(cookie_cfg.get("expiry_days", 14)),
         )
         return authenticator, True
-
-    # Fallback demo login (no secrets provided)
-    hashed = stauth.Hasher(["demo"]).generate()
+    
+    # Otherwise use config file
+    config = load_config()
     authenticator = stauth.Authenticate(
-        credentials={"usernames": {
-            "demo": {"name": "Demo User", "email": "demo@example.com", "password": hashed[0]}
-        }},
-        cookie_name="vs_app_session",
-        key="cookie-key",
-        cookie_expiry_days=14,
+        credentials=config['credentials'],
+        cookie_name=config['cookie']['name'],
+        key=config['cookie']['key'],
+        cookie_expiry_days=config['cookie']['expiry_days']
     )
     return authenticator, False
 
 # ----------------------------- Authentication -----------------------------
 authenticator, using_secrets = build_authenticator()
 
-# Call the login widget - this must be done ONCE and outside any context
-# The method returns a tuple: (name, authentication_status, username)
-login_result = authenticator.login(fields={'Form name': 'Login'}, location='sidebar')
+# Initialize session state for showing auth forms
+if 'show_signup' not in st.session_state:
+    st.session_state.show_signup = False
 
-# Handle the result - check if it's None or a tuple
-if login_result is None:
-    # Login hasn't been attempted yet or returned None
-    st.stop()
-elif isinstance(login_result, tuple) and len(login_result) == 3:
-    name, auth_status, username = login_result
-else:
-    # Unexpected return value
-    st.error("Authentication system error. Please refresh the page.")
-    st.stop()
-
-# Display status messages in sidebar
+# Sidebar authentication section
 with st.sidebar:
+    st.markdown("### 👤 Account")
+    
+    # Try to login automatically from cookie
+    try:
+        login_result = authenticator.login(fields={'Form name': 'Login'}, location='sidebar')
+        
+        if login_result is None:
+            name, auth_status, username = None, None, None
+        elif isinstance(login_result, tuple) and len(login_result) == 3:
+            name, auth_status, username = login_result
+        else:
+            name, auth_status, username = None, None, None
+    except Exception as e:
+        name, auth_status, username = None, None, None
+    
+    # Handle authentication status
     if auth_status:
         st.success(f"Hello, {name}!")
         authenticator.logout("Logout", "sidebar")
     elif auth_status is False:
         st.error("Username/password is incorrect.")
-        st.stop()
-    elif auth_status is None:
-        st.info("Please enter your username and password.")
-        st.stop()
+    else:
+        # Show sign-up option
+        if not st.session_state.show_signup:
+            if st.button("Create an account", use_container_width=True):
+                st.session_state.show_signup = True
+                st.rerun()
+        
+        # Show sign-up form if requested
+        if st.session_state.show_signup:
+            st.markdown("---")
+            st.markdown("#### Sign Up")
+            
+            try:
+                if not using_secrets:  # Only allow signup with config file
+                    if authenticator.register_user('Register user', location='sidebar', preauthorization=False):
+                        st.success('User registered successfully!')
+                        # Save the updated config
+                        config = load_config()
+                        config['credentials'] = authenticator.credentials
+                        save_config(config)
+                        st.session_state.show_signup = False
+                        st.rerun()
+                else:
+                    st.warning("Sign-up is disabled when using secrets configuration.")
+            except Exception as e:
+                st.error(f"Registration error: {e}")
+            
+            if st.button("Back to Login", use_container_width=True):
+                st.session_state.show_signup = False
+                st.rerun()
 
-# If we get here, user is authenticated
+# Set username for non-authenticated users
 if not auth_status:
-    st.stop()
+    username = "guest"
+    st.sidebar.info("👁️ Browsing as Guest. Login to upload files.")
 
 # ----------------------------- OpenAI Helpers -----------------------------
 def get_client() -> OpenAI:
@@ -305,7 +371,10 @@ if vector_store_id:
 
 # ----------------------------- Header -----------------------------
 st.markdown('<div style="display:flex;gap:.6rem;align-items:center;"><span style="font-size:1.6rem">📄</span><h1 style="margin:0">PDF Q&A</h1></div>', unsafe_allow_html=True)
-st.caption("Upload → Ingest → Search (Vector Store & Structured DB) • Signed in as **{}**".format(username))
+if auth_status:
+    st.caption("Upload → Ingest → Search (Vector Store & Structured DB) • Signed in as **{}**".format(username))
+else:
+    st.caption("Upload → Ingest → Search (Vector Store & Structured DB) • Browsing as Guest")
 
 # ----------------------------- Tabs -----------------------------
 tab_upload, tab_ask, tab_all, tab_files, tab_library = st.tabs(
@@ -315,41 +384,47 @@ tab_upload, tab_ask, tab_all, tab_files, tab_library = st.tabs(
 # ================== Upload & Inspect ==================
 with tab_upload:
     st.markdown('<div class="card"><h4 class="compact">Upload unstructured content</h4><div>PDF/Markdown → Vector Store + Structured DB</div></div>', unsafe_allow_html=True)
-    uf = st.file_uploader("Drop a PDF or Markdown", type=["pdf", "md", "txt"])
-    if uf is not None:
-        up_dir = Path("Uploads")
-        up_dir.mkdir(exist_ok=True)
-        save_path = up_dir / uf.name
-        with open(save_path, "wb") as f:
-            f.write(uf.read())
-        st.success(f"Saved: {save_path}")
+    
+    # Check if user is authenticated
+    if not auth_status:
+        st.warning("🔒 Please login to upload files. You can still browse and query existing files.")
+        st.info("Click 'Create an account' in the sidebar to sign up, or use demo credentials: username=`demo`, password=`demo`")
+    else:
+        uf = st.file_uploader("Drop a PDF or Markdown", type=["pdf", "md", "txt"])
+        if uf is not None:
+            up_dir = Path("Uploads")
+            up_dir.mkdir(exist_ok=True)
+            save_path = up_dir / uf.name
+            with open(save_path, "wb") as f:
+                f.write(uf.read())
+            st.success(f"Saved: {save_path}")
 
-        c1, c2 = st.columns(2)
-        if c1.button("Upload to Vector Store"):
-            try:
-                client = get_client()
-                vs_id = os.environ.get("OPENAI_VECTOR_STORE_ID")
-                if not vs_id:
-                    st.error("Set OPENAI_VECTOR_STORE_ID in sidebar or secrets.")
-                    st.stop()
-                with open(save_path, "rb") as fh:
-                    up = client.files.create(file=fh, purpose="assistants")
-                client.vector_stores.file_batches.create(vector_store_id=vs_id, file_ids=[up.id])
-                # Track in library
-                upsert_file_meta(up.id, uf.name, username)
-                st.success("Queued for indexing in Vector Store and added to Library.")
-            except Exception as e:
-                st.error(f"Vector upload failed: {e}")
+            c1, c2 = st.columns(2)
+            if c1.button("Upload to Vector Store"):
+                try:
+                    client = get_client()
+                    vs_id = os.environ.get("OPENAI_VECTOR_STORE_ID")
+                    if not vs_id:
+                        st.error("Set OPENAI_VECTOR_STORE_ID in sidebar or secrets.")
+                        st.stop()
+                    with open(save_path, "rb") as fh:
+                        up = client.files.create(file=fh, purpose="assistants")
+                    client.vector_stores.file_batches.create(vector_store_id=vs_id, file_ids=[up.id])
+                    # Track in library
+                    upsert_file_meta(up.id, uf.name, username)
+                    st.success("Queued for indexing in Vector Store and added to Library.")
+                except Exception as e:
+                    st.error(f"Vector upload failed: {e}")
 
-        if c2.button("Parse → JSONL → SQLite"):
-            try:
-                out_dir = Path("json_chunks")
-                out_dir.mkdir(exist_ok=True)
-                os.system(f'python3 parse_papers_to_json.py --input "{save_path}" --output "{out_dir}" --max-tokens 800 --overlap 120')
-                os.system('python3 build_jsonl_sqlite.py --input "./json_chunks" --db papers.db')
-                st.success("Parsed and loaded into SQLite.")
-            except Exception as e:
-                st.error(f"Structured pipeline failed: {e}")
+            if c2.button("Parse → JSONL → SQLite"):
+                try:
+                    out_dir = Path("json_chunks")
+                    out_dir.mkdir(exist_ok=True)
+                    os.system(f'python3 parse_papers_to_json.py --input "{save_path}" --output "{out_dir}" --max-tokens 800 --overlap 120')
+                    os.system('python3 build_jsonl_sqlite.py --input "./json_chunks" --db papers.db')
+                    st.success("Parsed and loaded into SQLite.")
+                except Exception as e:
+                    st.error(f"Structured pipeline failed: {e}")
 
 # ================== Ask ==================
 with tab_ask:
