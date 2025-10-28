@@ -109,16 +109,25 @@ def build_authenticator():
     )
     return authenticator, False
 
+# ----------------------------- Authentication -----------------------------
 authenticator, using_secrets = build_authenticator()
-with st.sidebar:
-    st.write("### Login")
+
+# The login method MUST be called outside of any st.sidebar or other context manager
+try:
+    # Try the newer API (streamlit-authenticator >= 0.2.0)
     name, auth_status, username = authenticator.login(location="sidebar")
+except TypeError:
+    # Fallback for older API (streamlit-authenticator < 0.2.0)
+    name, auth_status, username = authenticator.login("sidebar", "Login")
+
+# Now we can use the sidebar for status messages
+with st.sidebar:
     if auth_status:
         st.success(f"Hello, {name}!")
         authenticator.logout("Logout", "sidebar")
     elif auth_status is False:
         st.error("Username/password is incorrect.")
-    else:
+    elif auth_status is None:
         st.info("Please log in to continue.")
 
 if not auth_status:
@@ -133,7 +142,7 @@ def get_client() -> OpenAI:
 DEFAULT_SYSTEM = """You are a retrieval-first assistant for scientific PDFs attached via File Search.
 QUERY REFORMULATION: rewrite into 1–4 sub-queries with synonyms/acronyms.
 RETRIEVAL: always call File Search; if recall is weak, retry once broadly.
-ANSWER: exactly one sentence with one short quote in “double quotes”, ending with [<filename> p.<page> §<section>] (use p.—/§— if unknown).
+ANSWER: exactly one sentence with one short quote in "double quotes", ending with [<filename> p.<page> §<section>] (use p.—/§— if unknown).
 If nothing relevant: No direct evidence found in the provided files.
 """
 
@@ -183,138 +192,98 @@ def extract_file_ids_from_responses(resp) -> List[str]:
         pass
     return list(file_ids)
 
-def extract_file_ids_from_messages(messages_list) -> List[str]:
+def extract_file_ids_from_assistant(msg) -> List[str]:
     file_ids: Set[str] = set()
     try:
-        for msg in messages_list:
-            if getattr(msg, "role", "") != "assistant":
-                continue
-            for item in (msg.content or []):
-                if getattr(item, "type", "") == "text":
-                    for ann in (getattr(item.text, "annotations", []) or []):
-                        if getattr(ann, "type", "") == "file_citation":
-                            fid = getattr(ann.file_citation, "file_id", None)
-                            if fid:
-                                file_ids.add(fid)
+        for c in msg.content:
+            if c.type == "text" and hasattr(c, "text"):
+                for ann in c.text.annotations:
+                    if ann.type == "file_citation":
+                        if hasattr(ann.file_citation, "file_id"):
+                            file_ids.add(ann.file_citation.file_id)
     except Exception:
         pass
     return list(file_ids)
 
-def ask_with_responses(client: OpenAI, model: str, vs_id: str, system: str, userq: str):
-    # Try current field name first
-    try:
-        return client.responses.create(
-            model=model,
-            input=[{"role": "system", "content": system.strip()},
-                   {"role": "user", "content": userq.strip()}],
-            tools=[{"type": "file_search"}],
-            file_search={"vector_store_ids": [vs_id]},
-        ), "responses"
-    except Exception:
-        pass
-    # Older placement
-    try:
-        return client.responses.create(
-            model=model,
-            input=[{"role": "system", "content": system.strip()},
-                   {"role": "user", "content": userq.strip()}],
-            tools=[{"type": "file_search"}],
-            tool_resources={"file_search": {"vector_store_ids": [vs_id]}},
-        ), "responses"
-    except Exception:
-        # Extra body escape hatch
-        return client.responses.create(
-            model=model,
-            input=[{"role": "system", "content": system.strip()},
-                   {"role": "user", "content": userq.strip()}],
-            tools=[{"type": "file_search"}],
-            extra_body={"tool_resources": {"file_search": {"vector_store_ids": [vs_id]}}},
-        ), "responses"
-
-def ask_with_assistants(client: OpenAI, model: str, vs_id: str, system: str, userq: str):
-    asst = client.beta.assistants.create(
-        name="Streamlit PDF QA (temp)",
+def ask_with_responses(client: OpenAI, model: str, vs_id: str, system: str, question: str):
+    resp = client.responses.create(
         model=model,
-        instructions=system.strip(),
+        input_text=question,
+        system=[{"type": "text", "text": system}],
+        tools=[
+            {
+                "type": "file_search",
+                "file_search": {"vector_store_ids": [vs_id]},
+            }
+        ],
+        response_format={"type": "text"},
+    )
+    return resp, extract_file_ids_from_responses(resp)
+
+def ask_with_assistants(client: OpenAI, model: str, vs_id: str, system: str, question: str):
+    asst = client.beta.assistants.create(
+        model=model,
+        instructions=system,
         tools=[{"type": "file_search"}],
         tool_resources={"file_search": {"vector_store_ids": [vs_id]}},
     )
-    thread = client.beta.threads.create()
-    client.beta.threads.messages.create(thread_id=thread.id, role="user", content=userq.strip())
-    run: Run = client.beta.threads.runs.create(thread_id=thread.id, assistant_id=asst.id)
-    deadline = time.time() + 60 * 6
-    sleep_s = .75
-    while True:
-        run = client.beta.threads.runs.retrieve(thread_id=thread.id, run_id=run.id)
-        if run.status in {"completed", "failed", "cancelled", "expired"}:
-            break
-        if time.time() > deadline:
-            raise RuntimeError("Run timed out.")
-        time.sleep(sleep_s)
-        sleep_s = min(sleep_s * 1.5, 6.0)
+    thread = client.beta.threads.create(messages=[{"role": "user", "content": question}])
+    run = client.beta.threads.runs.create_and_poll(thread_id=thread.id, assistant_id=asst.id)
     if run.status != "completed":
-        raise RuntimeError(f"Run did not complete: {run.status}")
-    msgs = client.beta.threads.messages.list(thread_id=thread.id, order="desc", limit=5)
-    answer_text = ""
-    for m in msgs.data:
-        if m.role != "assistant":
-            continue
-        for item in m.content:
-            if item.type == "text":
-                answer_text = item.text.value or ""
-                break
-        if answer_text:
-            break
-    file_ids = extract_file_ids_from_messages(msgs.data)
-    return {"output_text": answer_text, "_raw": {"messages": msgs, "assistant_id": asst.id, "thread_id": thread.id}}, "assistants", file_ids
+        raise RuntimeError(f"Run {run.id} status: {run.status}")
+    msgs = list(client.beta.threads.messages.list(thread_id=thread.id, order="asc"))
+    if not msgs:
+        raise RuntimeError("No messages returned.")
+    last_msg = msgs[-1]
+    text_parts = [c.text.value for c in last_msg.content if c.type == "text"]
+    fids = extract_file_ids_from_assistant(last_msg)
+    client.beta.assistants.delete(asst.id)
+    return {"output_text": " ".join(text_parts), "_raw": last_msg}, run, fids
 
 # ----------------------------- Library DB -----------------------------
-LIB_DB = Path("library.db")
+DB_PATH = Path("library.db")
 
 def init_library():
-    con = sqlite3.connect(LIB_DB)
-    cur = con.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS files_meta(
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS library (
             file_id TEXT PRIMARY KEY,
-            filename TEXT,
-            uploaded_by TEXT,
-            uploaded_at TEXT
+            filename TEXT NOT NULL,
+            uploaded_by TEXT NOT NULL,
+            uploaded_at TEXT NOT NULL
         )
     """)
-    con.commit()
-    con.close()
+    conn.commit()
+    conn.close()
 
-def upsert_file_meta(file_id: str, filename: str, who: str):
-    con = sqlite3.connect(LIB_DB)
-    cur = con.cursor()
-    cur.execute("""
-        INSERT INTO files_meta(file_id, filename, uploaded_by, uploaded_at)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(file_id) DO UPDATE SET
-          filename=excluded.filename,
-          uploaded_by=excluded.uploaded_by,
-          uploaded_at=excluded.uploaded_at
-    """, (file_id, filename, who, datetime.utcnow().isoformat(timespec="seconds")+"Z"))
-    con.commit()
-    con.close()
+def upsert_file_meta(file_id: str, filename: str, uploaded_by: str):
+    init_library()
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.execute(
+        "INSERT OR REPLACE INTO library (file_id, filename, uploaded_by, uploaded_at) VALUES (?, ?, ?, ?)",
+        (file_id, filename, uploaded_by, datetime.now().isoformat()),
+    )
+    conn.commit()
+    conn.close()
 
-def query_library(filter_user: str | None = None):
-    con = sqlite3.connect(LIB_DB)
-    cur = con.cursor()
-    if filter_user:
-        cur.execute("SELECT file_id, filename, uploaded_by, uploaded_at FROM files_meta WHERE uploaded_by=? ORDER BY uploaded_at DESC", (filter_user,))
+def query_library(username_filter: str = None):
+    init_library()
+    conn = sqlite3.connect(str(DB_PATH))
+    if username_filter:
+        rows = conn.execute(
+            "SELECT file_id, filename, uploaded_by, uploaded_at FROM library WHERE uploaded_by = ? ORDER BY uploaded_at DESC",
+            (username_filter,),
+        ).fetchall()
     else:
-        cur.execute("SELECT file_id, filename, uploaded_by, uploaded_at FROM files_meta ORDER BY uploaded_at DESC")
-    rows = cur.fetchall()
-    con.close()
+        rows = conn.execute(
+            "SELECT file_id, filename, uploaded_by, uploaded_at FROM library ORDER BY uploaded_at DESC"
+        ).fetchall()
+    conn.close()
     return rows
 
-init_library()
-
-# ----------------------------- Sidebar Inputs -----------------------------
-st.sidebar.markdown("---")
-st.sidebar.header("Settings")
+# ----------------------------- Sidebar Config -----------------------------
+st.sidebar.divider()
+st.sidebar.markdown("### Settings")
 api_key = st.sidebar.text_input("OPENAI_API_KEY", type="password", value=os.getenv("OPENAI_API_KEY", ""))
 vector_store_id = st.sidebar.text_input("OPENAI_VECTOR_STORE_ID", value=os.getenv("OPENAI_VECTOR_STORE_ID", ""))
 model = st.sidebar.text_input("Model", value="gpt-4o-mini")
@@ -496,4 +465,3 @@ with tab_library:
                 f"  Uploaded by **{uploaded_by}** at `{uploaded_at}`  \n"
                 f"  File ID: `{file_id}`"
             )
-
