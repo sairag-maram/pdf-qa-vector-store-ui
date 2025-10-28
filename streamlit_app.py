@@ -112,13 +112,23 @@ def build_authenticator():
 # ----------------------------- Authentication -----------------------------
 authenticator, using_secrets = build_authenticator()
 
-# The login method MUST be called outside of any st.sidebar or other context manager
+# The login method must be called with the correct parameters
+# Different versions of streamlit-authenticator have different APIs
 try:
-    # Try the newer API (streamlit-authenticator >= 0.2.0)
-    name, auth_status, username = authenticator.login(location="sidebar")
-except TypeError:
-    # Fallback for older API (streamlit-authenticator < 0.2.0)
-    name, auth_status, username = authenticator.login("sidebar", "Login")
+    # Try calling login with just the location parameter (newer versions)
+    name, auth_status, username = authenticator.login(location='sidebar')
+except TypeError as e:
+    # If that fails, try with form_name parameter (some versions)
+    try:
+        name, auth_status, username = authenticator.login('Login', 'sidebar')
+    except Exception as e2:
+        # Last resort: try with key parameter
+        try:
+            name, auth_status, username = authenticator.login(key='login_form', location='sidebar')
+        except Exception as e3:
+            st.error(f"Authentication error: {str(e3)}")
+            st.error("Please check your streamlit-authenticator version. Try: pip install streamlit-authenticator==0.2.3")
+            st.stop()
 
 # Now we can use the sidebar for status messages
 with st.sidebar:
