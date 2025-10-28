@@ -81,14 +81,17 @@ def load_config():
         with open(CONFIG_FILE, 'r') as file:
             return yaml.safe_load(file)
     else:
-        # Create default config
-        hashed = stauth.Hasher(["demo"]).generate()
+        # Create default config with demo user
+        # Create hasher instance and generate password hash
+        hasher = stauth.Hasher(['demo'])
+        hashed_passwords = hasher.generate()
+        
         config = {
             'credentials': {
                 'usernames': {
                     'demo': {
                         'name': 'Demo User',
-                        'password': hashed[0],
+                        'password': hashed_passwords[0],
                         'email': 'demo@example.com'
                     }
                 }
@@ -207,7 +210,8 @@ with st.sidebar:
                             st.error("Username already exists!")
                         else:
                             # Hash password and save
-                            hashed_pwd = stauth.Hasher([password_new]).generate()[0]
+                            hasher = stauth.Hasher([password_new])
+                            hashed_pwd = hasher.generate()[0]
                             config['credentials']['usernames'][username_new] = {
                                 'name': name_new,
                                 'email': email_new,
